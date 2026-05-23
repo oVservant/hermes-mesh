@@ -4,7 +4,7 @@
 
 **Mesh network for Hermes Agents — auto-discovery, radar dashboard, and task delegation between agents on the same local network.**
 
-[![Version](https://img.shields.io/badge/version-0.2.0-00ff88?style=flat-square)]()
+[![Version](https://img.shields.io/badge/version-0.3.0-00ff88?style=flat-square)]()
 [![Hermes Skill](https://img.shields.io/badge/hermes-skill-7c3aed?style=flat-square)]()
 [![License](https://img.shields.io/badge/license-MIT-555555?style=flat-square)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)]()
@@ -84,16 +84,32 @@ Or start the daemon directly:
 python ~/Projects/hermes-mesh/scripts/mesh-daemon.py --name server-linux
 ```
 
-### 3. Watch peers appear
+### 3. Start the handshake watcher (separate terminal)
+
+The watcher detects new peers and asks you to trust them:
+
+```bash
+python ~/Projects/hermes-mesh/scripts/mesh-handshake-watcher.py
+```
+
+When a new peer appears, you'll see:
+```
+⚡ New peer detected: MacBook @ 192.168.1.11
+Trust this peer? (y/n):
+```
+
+Say yes once — it's automatic forever after (TOFU).
+
+### 4. Watch peers appear
 
 ```bash
 /mesh status
 /mesh peers
 ```
 
-The first time a peer is detected, you'll be asked to trust it. Say yes once — it's automatic forever after.
+The first time a peer is detected, it'll already be in your peer list.
 
-### 4. Open the radar
+### 5. Open the radar
 
 ```bash
 /mesh dashboard
@@ -101,11 +117,18 @@ The first time a peer is detected, you'll be asked to trust it. Say yes once —
 
 Or open `dashboard/radar.html` directly in any browser.
 
-### 5. Delegate tasks
+### 6. Delegate tasks
 
 ```bash
 /mesh delegate server-linux "npm run build"
 /mesh broadcast "pull latest changes"
+```
+
+Or use the daemon directly for one-shot delegation:
+
+```bash
+python scripts/mesh-daemon.py --name my-agent --delegate "server-linux:build main.go"
+python scripts/mesh-daemon.py --name my-agent --broadcast "run tests"
 ```
 
 <br>
@@ -153,7 +176,7 @@ Or open `dashboard/radar.html` directly in any browser.
 |---|---|
 | **TOFU** | First encounter asks for manual approval. After that, auto-trusted. |
 | **API Token** | Share a secret token between agents for authenticated requests. |
-| **mTLS** | Certificate-based mutual authentication (coming in v0.3). |
+| **mTLS** | Certificate-based mutual authentication (coming in v0.4). |
 
 Trusted peers persist in `~/.hermes/mesh/known_peers.json`.
 
@@ -167,7 +190,8 @@ hermes-mesh/
 ├── README.md              ← This file
 ├── PRODUCT_VISION.md      ← Product vision (non-technical)
 ├── scripts/
-│   └── mesh-daemon.py     ← Discovery + heartbeat + handshake daemon
+│   ├── mesh-daemon.py              ← Discovery + heartbeat + handshake daemon
+│   └── mesh-handshake-watcher.py   ← Watcher that prompts user to trust new peers
 └── dashboard/
     └── radar.html          ← Standalone radar HTML (no server needed)
 ```
@@ -194,6 +218,6 @@ PRs welcome. Keep it simple — this project follows the **skill-first** philoso
 
 <div align="center">
 
-Made by [@oVservant](https://github.com/oVservant) · Hermes Mesh v0.2.0 · Skill-based · Zero-config · Peer-to-peer
+Made by [@oVservant](https://github.com/oVservant) · Hermes Mesh v0.3.0 · Skill-based · Zero-config · Peer-to-peer
 
 </div>
