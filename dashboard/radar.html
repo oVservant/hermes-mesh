@@ -1,117 +1,4 @@
-"""FastAPI application for Hermes Mesh."""
-
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Optional
-
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-
-from .config import load_config, Config
-from .discovery import Discovery
-from .heartbeat import HeartbeatEngine
-
-_config: Optional[Config] = None
-_discovery: Optional[Discovery] = None
-_heartbeat: Optional[HeartbeatEngine] = None
-
-
-def get_config() -> Config:
-    global _config
-    if _config is None:
-        _config = load_config()
-    return _config
-
-
-def get_discovery() -> Discovery | None:
-    global _discovery
-    return _discovery
-
-
-def get_heartbeat() -> HeartbeatEngine | None:
-    global _heartbeat
-    return _heartbeat
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _config, _discovery, _heartbeat
-    _config = load_config()
-
-    _discovery = Discovery(
-        agent_name=_config.mesh.agent_name,
-        http_port=_config.mesh.http_port,
-        heartbeat_port=_config.mesh.heartbeat_port,
-    )
-    _heartbeat = HeartbeatEngine(
-        agent_name=_config.mesh.agent_name,
-        port=_config.mesh.heartbeat_port,
-        interval=_config.mesh.heartbeat_interval,
-        missed_threshold=_config.mesh.missed_heartbeat_threshold,
-        discovery=_discovery,
-    )
-
-    _discovery.start()
-    _heartbeat.start()
-
-    yield
-
-    _heartbeat.stop()
-    _discovery.stop()
-
-
-app = FastAPI(title="Hermes Mesh", version="0.1.0", lifespan=lifespan)
-
-# Mount static files
-STATIC_DIR = Path(__file__).parent / "static"
-STATIC_DIR.mkdir(exist_ok=True)
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-
-@app.get("/status")
-async def status():
-    cfg = get_config()
-    hb = get_heartbeat()
-    disc = get_discovery()
-
-    return {
-        "agent": cfg.mesh.agent_name,
-        "version": "0.1.0",
-        "uptime_seconds": hb.uptime,
-        "status": hb.status,
-        "local_ip": disc.local_ip,
-        "http_port": cfg.mesh.http_port,
-        "heartbeat_port": cfg.mesh.heartbeat_port,
-        "peers": [
-            {
-                "name": node.name,
-                "address": node.address,
-                "status": node.status,
-                "last_heartbeat": node.last_heartbeat,
-            }
-            for node in hb.get_nodes()
-        ],
-        "discovered": [
-            {"name": p.name, "address": p.address, "last_seen": p.last_seen}
-            for p in disc.get_peers()
-        ],
-    }
-
-
-@app.get("/ping")
-async def ping(name: str = "unknown"):
-    """Heartbeat ping endpoint."""
-    return JSONResponse({"pong": True, "agent": get_config().mesh.agent_name, "peer": name})
-
-
-@app.get("/", response_class=HTMLResponse)
-async def dashboard():
-    """Render the radar dashboard."""
-    return DASHBOARD_HTML
-
-
-DASHBOARD_HTML = """<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -181,6 +68,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             border-radius: 4px;
             min-width: 200px;
         }
+        #error-msg {
+            display: none;
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(255, 51, 51, 0.1);
+            border: 1px solid #ff3333;
+            color: #ff3333;
+            padding: 8px 12px;
+            font-size: 11px;
+            border-radius: 4px;
+        }
     </style>
 </head>
 <body>
@@ -202,6 +101,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div id="agent-uptime"></div>
             <div id="peer-count"></div>
         </div>
+        <div id="error-msg"></div>
     </div>
     <script>
         const canvas = document.getElementById('radar');
@@ -210,6 +110,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         let peers = [];
         let sweepAngle = 0;
         let selfInfo = {};
+        let apiUrl = '/status';
 
         function resize() {
             canvas.width = canvas.parentElement.clientWidth;
@@ -220,20 +121,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
         async function fetchStatus() {
             try {
-                const resp = await fetch('/status');
+                const resp = await fetch(apiUrl);
                 const data = await resp.json();
                 selfInfo = data;
-                peers = data.peers;
+                peers = data.peers || [];
 
-                document.getElementById('agent-name').textContent = 'Agent: ' + data.agent;
-                document.getElementById('agent-ip').textContent = 'IP: ' + data.local_ip + ':' + data.http_port;
-                document.getElementById('agent-uptime').textContent = 'Uptime: ' + Math.floor(data.uptime_seconds) + 's';
+                document.getElementById('agent-name').textContent = 'Agent: ' + (data.agent || 'unknown');
+                document.getElementById('agent-ip').textContent = 'IP: ' + (data.local_ip || '?') + ':' + (data.http_port || '?');
+                document.getElementById('agent-uptime').textContent = 'Uptime: ' + Math.floor(data.uptime_seconds || 0) + 's';
                 document.getElementById('peer-count').textContent = 'Peers: ' + peers.length;
 
                 document.getElementById('status-dot').style.background =
                     peers.length > 0 ? '#00ff88' : '#555555';
+
+                document.getElementById('error-msg').style.display = 'none';
             } catch(e) {
-                console.warn('Status fetch failed:', e);
+                document.getElementById('error-msg').textContent = '⚠ Cannot reach mesh API — is the mesh daemon running?';
+                document.getElementById('error-msg').style.display = 'block';
             }
         }
 
@@ -244,7 +148,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             const cy = canvas.height / 2;
             const radius = Math.min(cx, cy) * 0.7;
 
-            // Radar grid
+            // Radar grid rings
             ctx.strokeStyle = '#0a2a0a';
             ctx.lineWidth = 1;
             for (let r = radius/3; r <= radius; r += radius/3) {
@@ -260,7 +164,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             ctx.moveTo(cx, cy - radius); ctx.lineTo(cx, cy + radius);
             ctx.stroke();
 
-            // Sweep line
+            // Sweep line (rotates)
             sweepAngle += 0.02;
             ctx.strokeStyle = 'rgba(0, 255, 136, 0.4)';
             ctx.lineWidth = 2;
@@ -272,12 +176,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             );
             ctx.stroke();
 
-            // Sweep glow
+            // Sweep glow (wedge)
             const gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
             gradient.addColorStop(0, 'rgba(0, 255, 136, 0.15)');
             gradient.addColorStop(0.4, 'rgba(0, 255, 136, 0.05)');
             gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
-
             ctx.fillStyle = gradient;
             ctx.beginPath();
             const sweepStart = sweepAngle - 0.15;
@@ -287,7 +190,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             ctx.closePath();
             ctx.fill();
 
-            // Center dot (self)
+            // Self dot (center)
             ctx.fillStyle = '#00ff88';
             ctx.shadowColor = '#00ff88';
             ctx.shadowBlur = 15;
@@ -296,8 +199,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             ctx.fill();
             ctx.shadowBlur = 0;
 
+            // Self label
+            ctx.fillStyle = '#00ff88';
+            ctx.font = '10px "Courier New"';
+            if (selfInfo.agent) {
+                ctx.fillText(selfInfo.agent + ' (you)', cx + 12, cy + 4);
+            }
+
             // Peer nodes
             peers.forEach((peer, i) => {
+                // Spread peers evenly around the radar
                 const angle = (i / Math.max(peers.length, 1)) * Math.PI * 2 + sweepAngle * 0.3;
                 const dist = radius * 0.7;
                 const px = cx + Math.cos(angle) * dist;
@@ -311,6 +222,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     default: color = '#555555';
                 }
 
+                // Glow
                 ctx.fillStyle = color;
                 ctx.shadowColor = color;
                 ctx.shadowBlur = peer.status === 'online' ? 10 : 4;
@@ -322,16 +234,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 // Label
                 ctx.fillStyle = color;
                 ctx.font = '10px "Courier New"';
-                ctx.fillText(peer.name, px + 10, py + 4);
-                ctx.fillText(peer.address, px + 10, py + 16);
+                ctx.fillText(peer.name || '?', px + 10, py + 4);
+                ctx.fillText(peer.address || '', px + 10, py + 16);
             });
 
             requestAnimationFrame(draw);
         }
 
+        // Start
         fetchStatus();
         setInterval(fetchStatus, 3000);
         draw();
     </script>
 </body>
-</html>"""
+</html>
