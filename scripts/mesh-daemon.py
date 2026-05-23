@@ -19,6 +19,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from threading import Thread, Lock
 from typing import Optional
+from urllib.request import Request, urlopen
+from urllib.error import URLError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -158,6 +160,37 @@ class MeshDaemon:
 
     # ── Zeroconf (mDNS) ────────────────────────────────────────────
 
+    # ── Task Delegation ───────────────────────────────────────────
+
+    def delegate_task(self, peer_id: str, task_description: str, timeout: int = 300) -> dict:
+        """Send a task to a specific peer via its Hermes Agent HTTP API."""
+        peer = self.get_peer(peer_id)
+        if not peer:
+            return {"success": False, "error": f"Peer not found: {peer_id}"}
+        if peer.status == "offline":
+            return {"success": False, "error": f"Peer is offline: {peer_id}"}
+
+        url = f"http://{peer.address}:{peer.api_port}/execute"
+        body = json.dumps({"command": task_description, "timeout": timeout}).encode()
+        req = Request(url, data=body, headers={"Content-Type": "application/json"})
+
+        try:
+            resp = urlopen(req, timeout=10)
+            result = json.loads(resp.read().decode())
+            return {"success": True, "peer": peer_id, "result": result}
+        except URLError as e:
+            return {"success": False, "peer": peer_id, "error": str(e.reason if hasattr(e, 'reason') else e)}
+
+    def broadcast_task(self, task_description: str, timeout: int = 300) -> list[dict]:
+        """Send a task to all online trusted peers."""
+        results = []
+        for peer in self.get_trusted_peers():
+            if peer.status == "online":
+                results.append(self.delegate_task(peer.id, task_description, timeout))
+        return results
+
+    # ── Zeroconf (mDNS) ────────────────────────────────────────────
+
     def _zeroconf_register(self):
         """Register our service so others can find us."""
         self._zeroconf = Zeroconf()
@@ -189,8 +222,9 @@ class MeshDaemon:
 
         browser = ServiceBrowser(self._zeroconf, SERVICE_TYPE, handlers=[self._on_service_change])
 
+        # Keep this thread alive — ServiceBrowser runs in its own Zeroconf thread
         while self._running:
-            time.sleep(10)
+            time.sleep(1)
 
     def _on_service_change(self, zeroconf, service_type, name, state_change):
         if state_change == ServiceStateChange.Added:
@@ -221,6 +255,17 @@ class MeshDaemon:
                 else:
                     logger.info(f"New peer discovered: {peer.id}")
                     self._on_new_peer(peer)
+
+        elif state_change == ServiceStateChange.Removed:
+            # Extract peer name from the service name
+            peer_name = name.replace(f".{SERVICE_TYPE}", "")
+            # Find and mark the matching peer as offline immediately
+            with self._lock:
+                for peer_id, peer in list(self.peers.items()):
+                    if peer.name == peer_name:
+                        peer.status = "offline"
+                        logger.info(f"Peer removed via mDNS: {peer_id}")
+                        break
 
     # ── UDP fallback (when zeroconf not available) ──────────────────
 
@@ -371,6 +416,8 @@ def main():
     parser.add_argument("--name", default=socket.gethostname(), help="Agent name")
     parser.add_argument("--api-port", type=int, default=8080, help="Hermes API port")
     parser.add_argument("--capabilities", default="", help="Comma-separated capabilities")
+    parser.add_argument("--delegate", default="", help="Delegate a task: 'peer_id:task description'")
+    parser.add_argument("--broadcast", default="", help="Broadcast a task to all online trusted peers")
     parser.add_argument("--debug", action="store_true", help="Debug logging")
     args = parser.parse_args()
 
@@ -386,6 +433,27 @@ def main():
     )
 
     daemon.start()
+
+    # Handle delegation / broadcast flags
+    if args.delegate:
+        if ":" not in args.delegate:
+            print("  Usage: --delegate \"peer_id:task description\"")
+            daemon.stop()
+            return
+        peer_id, task = args.delegate.split(":", 1)
+        print(f"\n  Delegating task to {peer_id}...")
+        result = daemon.delegate_task(peer_id.strip(), task.strip())
+        print(f"  Result: {json.dumps(result, indent=2)}")
+        daemon.stop()
+        return
+
+    if args.broadcast:
+        print(f"\n  Broadcasting task to all online trusted peers...")
+        results = daemon.broadcast_task(args.broadcast.strip())
+        for r in results:
+            print(f"  [{r['peer']}] {'OK' if r['success'] else 'FAIL'}: {r.get('result', r.get('error', 'unknown'))}")
+        daemon.stop()
+        return
 
     print(f"\n◈ Hermes Mesh v0.2.0")
     print(f"  Agent:    {daemon.self_info.name}")
