@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Hermes Mesh — Discovery + Heartbeat + Handshake daemon.
+Hermes Mesh — Discovery + Heartbeat + Handshake + Delegation daemon.
 Uses Zeroconf (mDNS) for peer discovery. No external server needed.
 
+Runs discovery threads, heartbeat, and a lightweight HTTP server for
+receiving delegated tasks from peers. Delegation is direct peer-to-peer
+using the daemon's own HTTP server — no Hermes API dependency.
+
 Usage:
-    python mesh-daemon.py [--name SERVER-LINUX] [--api-port 8080]
+    python mesh-daemon.py [--name SERVER-LINUX] [--mesh-port 9445] [--interactive]
 """
 
 import argparse
@@ -14,8 +18,8 @@ import os
 import socket
 import sys
 import time
-import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from threading import Thread, Lock
 from typing import Optional
@@ -47,6 +51,7 @@ SERVICE_TYPE = "_hermes-mesh._tcp.local."
 DISCOVERY_PORT = 9445
 HEARTBEAT_INTERVAL = 3.0
 MISSED_THRESHOLD = 3
+MESH_VERSION = "0.3.0"
 
 
 # ── Data types ──────────────────────────────────────────────────────────
@@ -55,11 +60,11 @@ MISSED_THRESHOLD = 3
 class Peer:
     name: str
     address: str
-    api_port: int = 8080
+    mesh_port: int = 9445
     status: str = "online"     # online | busy | offline
     last_seen: float = field(default_factory=time.time)
     trusted: bool = False       # TOFU — accepted manually first time
-    capabilities: list[str] = field(default_factory=list)
+    capabilities: list = field(default_factory=list)
 
     @property
     def id(self) -> str:
@@ -70,28 +75,102 @@ class Peer:
 class SelfInfo:
     name: str
     address: str
-    api_port: int
-    capabilities: list[str]
+    mesh_port: int
+    capabilities: list
+
+
+# ── HTTP Server for receiving delegated tasks ────────────────────────────
+
+class MeshHTTPHandler(BaseHTTPRequestHandler):
+    """Lightweight server that receives delegated tasks from peers."""
+
+    daemon: Optional["MeshDaemon"] = None  # set by the factory
+
+    def log_message(self, format, *args):
+        logger.debug(f"HTTP: {args[0]}")
+
+    def do_GET(self):
+        if self.path == "/status":
+            summary = self.daemon.get_status_summary()
+            self._json_response(200, summary)
+        else:
+            self._json_response(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path == "/execute":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                self._json_response(400, {"error": "invalid JSON"})
+                return
+
+            command = data.get("command", "")
+            task_id = data.get("task_id", "")
+
+            task_entry = {
+                "command": command,
+                "task_id": task_id,
+                "from_peer": data.get("from_peer", "unknown"),
+                "received_at": time.time(),
+            }
+
+            # Store in pending tasks file — Hermes skill picks it up
+            pending_tasks_path = MESH_HOME / "pending_tasks.json"
+            self.daemon._with_lock_write_json(pending_tasks_path, task_entry)
+
+            # Mark peer as busy
+            self.daemon.mark_self_busy()
+
+            logger.info(f"Received task from {data.get('from_peer', 'unknown')}: {command[:80]}")
+            self._json_response(200, {"status": "accepted", "task_id": task_id})
+        else:
+            self._json_response(404, {"error": "not found"})
+
+    def _json_response(self, code: int, data: dict):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def _make_handler(daemon: "MeshDaemon"):
+    """Factory to inject daemon reference into the handler."""
+    class Handler(MeshHTTPHandler):
+        pass
+    Handler.daemon = daemon
+    return Handler
 
 
 # ── Mesh Daemon ─────────────────────────────────────────────────────────
 
 class MeshDaemon:
-    """Runs discovery, heartbeat, and handshake in background threads."""
+    """Runs discovery, heartbeat, handshake, and delegation in background threads."""
 
-    def __init__(self, agent_name: str, api_port: int, capabilities: list[str] = None):
+    def __init__(
+        self,
+        agent_name: str,
+        mesh_port: int = 9445,
+        capabilities: list = None,
+        interactive: bool = False,
+    ):
+        self.interactive = interactive
         self.self_info = SelfInfo(
             name=agent_name,
             address=self._get_local_ip(),
-            api_port=api_port,
+            mesh_port=mesh_port,
             capabilities=capabilities or [],
         )
-        self.peers: dict[str, Peer] = {}
+        self.peers: dict = {}
         self._lock = Lock()
         self._running = False
         self._zeroconf: Optional[Zeroconf] = None
         self._service_info: Optional[ServiceInfo] = None
-        self._threads: list[Thread] = []
+        self._http_server: Optional[HTTPServer] = None
+        self._threads: list = []
 
         MESH_HOME.mkdir(parents=True, exist_ok=True)
         self._load_known_peers()
@@ -99,8 +178,13 @@ class MeshDaemon:
     # ── Public API ──────────────────────────────────────────────────
 
     def start(self):
-        """Start discovery + heartbeat threads."""
+        """Start all threads: discovery, heartbeat, HTTP server, handshake (optional)."""
         self._running = True
+
+        # HTTP task receiver
+        handler = _make_handler(self)
+        self._http_server = HTTPServer(("0.0.0.0", self.self_info.mesh_port), handler)
+        self._threads.append(Thread(target=self._run_http_server, daemon=True))
 
         if HAS_ZEROCONF:
             self._threads.append(Thread(target=self._zeroconf_register, daemon=True))
@@ -110,20 +194,27 @@ class MeshDaemon:
 
         self._threads.append(Thread(target=self._heartbeat_loop, daemon=True))
 
+        if self.interactive:
+            self._threads.append(Thread(target=self._handshake_thread, daemon=True))
+
         for t in self._threads:
             t.start()
 
-        logger.info(f"Mesh started — {self.self_info.name} @ {self.self_info.address}:{self.self_info.api_port}")
+        logger.info(
+            f"Mesh started — {self.self_info.name} @ {self.self_info.address}:{self.self_info.mesh_port}"
+        )
         return self
 
     def stop(self):
         self._running = False
         if self._zeroconf:
             self._zeroconf.close()
+        if self._http_server:
+            self._http_server.shutdown()
         self._save_known_peers()
         logger.info("Mesh stopped")
 
-    def get_peers(self, status_filter: str = None) -> list[Peer]:
+    def get_peers(self, status_filter: str = None) -> list:
         with self._lock:
             peers = list(self.peers.values())
         if status_filter:
@@ -134,7 +225,7 @@ class MeshDaemon:
         with self._lock:
             return self.peers.get(peer_id)
 
-    def get_trusted_peers(self) -> list[Peer]:
+    def get_trusted_peers(self) -> list:
         return [p for p in self.get_peers() if p.trusted]
 
     def trust_peer(self, peer_id: str) -> bool:
@@ -145,33 +236,59 @@ class MeshDaemon:
                 return True
         return False
 
+    def reject_peer(self, peer_id: str):
+        with self._lock:
+            self.peers.pop(peer_id, None)
+
+    def mark_self_busy(self):
+        """Mark the local agent as busy (used when a task is received)."""
+        with self._lock:
+            pass  # Status is per-peer, self doesn't have a peer entry
+        # Signal file that Hermes skill can read
+        busy_path = MESH_HOME / "agent_status.json"
+        busy_path.write_text(json.dumps({"status": "busy", "updated": time.time()}))
+
+    def mark_self_idle(self):
+        idle_path = MESH_HOME / "agent_status.json"
+        idle_path.write_text(json.dumps({"status": "online", "updated": time.time()}))
+
     def get_status_summary(self) -> dict:
         peers = self.get_peers()
         return {
             "agent": self.self_info.name,
             "address": self.self_info.address,
-            "api_port": self.self_info.api_port,
+            "mesh_port": self.self_info.mesh_port,
             "peers_total": len(peers),
             "peers_online": len([p for p in peers if p.status == "online"]),
             "peers_trusted": len([p for p in peers if p.trusted]),
-            "peers": [{"id": p.id, "name": p.name, "address": p.address, "status": p.status, "trusted": p.trusted}
-                      for p in peers],
+            "peers": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "address": p.address,
+                    "status": p.status,
+                    "trusted": p.trusted,
+                }
+                for p in peers
+            ],
         }
 
-    # ── Zeroconf (mDNS) ────────────────────────────────────────────
-
-    # ── Task Delegation ───────────────────────────────────────────
+    # ── Delegation (outgoing) ────────────────────────────────────
 
     def delegate_task(self, peer_id: str, task_description: str, timeout: int = 300) -> dict:
-        """Send a task to a specific peer via its Hermes Agent HTTP API."""
+        """Send a task to a specific peer's mesh HTTP server."""
         peer = self.get_peer(peer_id)
         if not peer:
             return {"success": False, "error": f"Peer not found: {peer_id}"}
         if peer.status == "offline":
             return {"success": False, "error": f"Peer is offline: {peer_id}"}
 
-        url = f"http://{peer.address}:{peer.api_port}/execute"
-        body = json.dumps({"command": task_description, "timeout": timeout}).encode()
+        url = f"http://{peer.address}:{peer.mesh_port}/execute"
+        payload = {
+            "command": task_description,
+            "from_peer": self.self_info.name,
+        }
+        body = json.dumps(payload).encode()
         req = Request(url, data=body, headers={"Content-Type": "application/json"})
 
         try:
@@ -179,9 +296,13 @@ class MeshDaemon:
             result = json.loads(resp.read().decode())
             return {"success": True, "peer": peer_id, "result": result}
         except URLError as e:
-            return {"success": False, "peer": peer_id, "error": str(e.reason if hasattr(e, 'reason') else e)}
+            return {
+                "success": False,
+                "peer": peer_id,
+                "error": str(e.reason if hasattr(e, "reason") else e),
+            }
 
-    def broadcast_task(self, task_description: str, timeout: int = 300) -> list[dict]:
+    def broadcast_task(self, task_description: str, timeout: int = 300) -> list:
         """Send a task to all online trusted peers."""
         results = []
         for peer in self.get_trusted_peers():
@@ -189,12 +310,23 @@ class MeshDaemon:
                 results.append(self.delegate_task(peer.id, task_description, timeout))
         return results
 
-    # ── Zeroconf (mDNS) ────────────────────────────────────────────
+    # ── HTTP server thread ──────────────────────────────────────
+
+    def _run_http_server(self):
+        logger.info(f"Task receiver listening on :{self.self_info.mesh_port}")
+        while self._running:
+            try:
+                self._http_server.handle_request()
+            except Exception as e:
+                if self._running:
+                    logger.warning(f"HTTP server error: {e}")
+                time.sleep(0.5)
+
+    # ── Zeroconf (mDNS) ────────────────────────────────────────
 
     def _zeroconf_register(self):
         """Register our service so others can find us."""
         self._zeroconf = Zeroconf()
-
         service_name = f"{self.self_info.name}.{SERVICE_TYPE}"
         local_ip = socket.inet_aton(self.self_info.address)
 
@@ -202,10 +334,10 @@ class MeshDaemon:
             type_=SERVICE_TYPE,
             name=service_name,
             addresses=[local_ip],
-            port=self.self_info.api_port,
+            port=self.self_info.mesh_port,
             properties={
                 "name": self.self_info.name,
-                "version": "0.2.0",
+                "version": MESH_VERSION,
                 "capabilities": ",".join(self.self_info.capabilities),
             },
         )
@@ -220,9 +352,8 @@ class MeshDaemon:
         while not self._zeroconf:
             time.sleep(0.5)
 
-        browser = ServiceBrowser(self._zeroconf, SERVICE_TYPE, handlers=[self._on_service_change])
+        ServiceBrowser(self._zeroconf, SERVICE_TYPE, handlers=[self._on_service_change])
 
-        # Keep this thread alive — ServiceBrowser runs in its own Zeroconf thread
         while self._running:
             time.sleep(1)
 
@@ -232,17 +363,22 @@ class MeshDaemon:
             if info and info.parsed_addresses():
                 peer_name = info.properties.get(b"name", b"unknown").decode()
                 if peer_name == self.self_info.name:
-                    return  # That's us
+                    return
 
                 peer = Peer(
                     name=peer_name,
                     address=info.parsed_addresses()[0],
-                    api_port=info.port,
-                    capabilities=info.properties.get(b"capabilities", b"").decode().split(",") if info.properties.get(b"capabilities") else [],
+                    mesh_port=info.port,
+                    capabilities=(
+                        info.properties.get(b"capabilities", b"")
+                        .decode()
+                        .split(",")
+                        if info.properties.get(b"capabilities")
+                        else []
+                    ),
                     last_seen=time.time(),
                 )
 
-                # Check if already known
                 existing = self.get_peer(peer.id)
                 if existing and existing.trusted:
                     peer.trusted = True
@@ -257,9 +393,7 @@ class MeshDaemon:
                     self._on_new_peer(peer)
 
         elif state_change == ServiceStateChange.Removed:
-            # Extract peer name from the service name
             peer_name = name.replace(f".{SERVICE_TYPE}", "")
-            # Find and mark the matching peer as offline immediately
             with self._lock:
                 for peer_id, peer in list(self.peers.items()):
                     if peer.name == peer_name:
@@ -267,7 +401,7 @@ class MeshDaemon:
                         logger.info(f"Peer removed via mDNS: {peer_id}")
                         break
 
-    # ── UDP fallback (when zeroconf not available) ──────────────────
+    # ── UDP fallback ──────────────────────────────────────────────────
 
     def _udp_discovery_loop(self):
         """UDP broadcast-based discovery — fallback when mDNS unavailable."""
@@ -283,7 +417,10 @@ class MeshDaemon:
 
         while self._running:
             try:
-                announce = f"HERMES-MESH|{self.self_info.name}|{self.self_info.address}|{self.self_info.api_port}|{','.join(self.self_info.capabilities)}"
+                announce = (
+                    f"HERMES-MESH|{self.self_info.name}|{self.self_info.address}"
+                    f"|{self.self_info.mesh_port}|{','.join(self.self_info.capabilities)}"
+                )
                 sock.sendto(announce.encode(), ("255.255.255.255", DISCOVERY_PORT))
 
                 start = time.time()
@@ -302,7 +439,7 @@ class MeshDaemon:
         if data.startswith("HERMES-MESH|"):
             parts = data.split("|")
             if len(parts) >= 4:
-                _, name, ip, api_port = parts[:4]
+                _, name, ip, mesh_port = parts[:4]
                 capabilities = parts[4].split(",") if len(parts) > 4 and parts[4] else []
                 if name == self.self_info.name:
                     return
@@ -310,7 +447,7 @@ class MeshDaemon:
                 peer = Peer(
                     name=name,
                     address=ip,
-                    api_port=int(api_port),
+                    mesh_port=int(mesh_port),
                     capabilities=capabilities,
                     last_seen=time.time(),
                 )
@@ -331,9 +468,26 @@ class MeshDaemon:
     # ── Heartbeat ──────────────────────────────────────────────────
 
     def _heartbeat_loop(self):
-        """Periodically check that known peers are still alive."""
+        """Check known peers are alive; also send heartbeat pings."""
         while self._running:
             time.sleep(HEARTBEAT_INTERVAL)
+
+            # Ping trusted peers via their /status endpoint
+            for peer in self.get_trusted_peers():
+                try:
+                    url = f"http://{peer.address}:{peer.mesh_port}/status"
+                    resp = urlopen(url, timeout=2)
+                    if resp.status == 200:
+                        with self._lock:
+                            if peer.id in self.peers:
+                                self.peers[peer.id].last_seen = time.time()
+                                if self.peers[peer.id].status == "offline":
+                                    self.peers[peer.id].status = "online"
+                                    logger.info(f"Peer came back online: {peer.id}")
+                except Exception:
+                    pass
+
+            # Detect dead peers
             with self._lock:
                 for peer_id, peer in list(self.peers.items()):
                     if time.time() - peer.last_seen > HEARTBEAT_INTERVAL * MISSED_THRESHOLD:
@@ -341,7 +495,7 @@ class MeshDaemon:
                             peer.status = "offline"
                             logger.info(f"Peer went offline: {peer_id}")
 
-            # Prune peers that have been offline for > 60s
+            # Prune untrusted offline peers
             with self._lock:
                 for peer_id, peer in list(self.peers.items()):
                     if peer.status == "offline" and time.time() - peer.last_seen > 60:
@@ -349,21 +503,56 @@ class MeshDaemon:
                             del self.peers[peer_id]
                             logger.info(f"Pruned untrusted offline peer: {peer_id}")
 
+    # ── Handshake (built-in, runs as thread when --interactive) ────
+
+    def _handshake_thread(self):
+        """Watch for new peers and prompt the user to trust them."""
+        logger.info("Handshake watcher started — you'll be prompted for new peers")
+        seen_handshakes = set()
+
+        while self._running:
+            signal_path = MESH_HOME / "pending_handshake.json"
+            if signal_path.exists():
+                try:
+                    data = json.loads(signal_path.read_text())
+                    peer_id = data.get("id", "")
+                    if peer_id not in seen_handshakes:
+                        name = data.get("name", "unknown")
+                        address = data.get("address", "unknown")
+                        print(f"\n  ⚡ New peer detected: {name} @ {address}")
+                        try:
+                            choice = input("  Trust this peer? (y/n): ").strip().lower()
+                        except (EOFError, KeyboardInterrupt):
+                            print()
+                            break
+                        if choice in ("y", "yes"):
+                            self.trust_peer(peer_id)
+                            print(f"  -> Peer trusted: {peer_id}")
+                        else:
+                            self.reject_peer(peer_id)
+                            print(f"  -> Peer rejected: {peer_id}")
+                        seen_handshakes.add(peer_id)
+                    signal_path.unlink()
+                except Exception:
+                    pass
+            time.sleep(2)
+
     # ── New peer handler ───────────────────────────────────────────
 
     def _on_new_peer(self, peer: Peer):
-        """Called when a new (untrusted) peer is discovered.
-        The skill's handshake handler will prompt the user to trust them.
-        """
-        # Signal file for the skill to pick up
+        """Write signal file for handshake (picked up by interactive thread or external watcher)."""
         signal_path = MESH_HOME / "pending_handshake.json"
-        signal_path.write_text(json.dumps({
-            "name": peer.name,
-            "address": peer.address,
-            "api_port": peer.api_port,
-            "id": peer.id,
-            "timestamp": time.time(),
-        }))
+        signal_path.write_text(
+            json.dumps(
+                {
+                    "name": peer.name,
+                    "address": peer.address,
+                    "mesh_port": peer.mesh_port,
+                    "id": peer.id,
+                    "timestamp": time.time(),
+                }
+            )
+        )
 
     # ── Persistence ────────────────────────────────────────────────
 
@@ -376,7 +565,7 @@ class MeshDaemon:
                         peer = Peer(
                             name=entry["name"],
                             address=entry["address"],
-                            api_port=entry.get("api_port", 8080),
+                            mesh_port=entry.get("mesh_port", 9445),
                             trusted=True,
                             capabilities=entry.get("capabilities", []),
                         )
@@ -388,12 +577,31 @@ class MeshDaemon:
     def _save_known_peers(self):
         trusted = [p for p in self.get_peers() if p.trusted]
         data = [
-            {"name": p.name, "address": p.address, "api_port": p.api_port, "capabilities": p.capabilities}
+            {
+                "name": p.name,
+                "address": p.address,
+                "mesh_port": p.mesh_port,
+                "capabilities": p.capabilities,
+            }
             for p in trusted
         ]
         KNOWN_PEERS_PATH.parent.mkdir(parents=True, exist_ok=True)
         KNOWN_PEERS_PATH.write_text(json.dumps(data, indent=2))
         logger.info(f"Saved {len(trusted)} trusted peers")
+
+    def _with_lock_write_json(self, path: Path, entry: dict):
+        """Thread-safe JSON append to a file (simple last-write-wins for tasks)."""
+        with self._lock:
+            existing = []
+            if path.exists():
+                try:
+                    existing = json.loads(path.read_text())
+                    if not isinstance(existing, list):
+                        existing = []
+                except (json.JSONDecodeError, FileNotFoundError):
+                    existing = []
+            existing.append(entry)
+            path.write_text(json.dumps(existing, indent=2))
 
     # ── Utils ──────────────────────────────────────────────────────
 
@@ -414,10 +622,32 @@ class MeshDaemon:
 def main():
     parser = argparse.ArgumentParser(description="Hermes Mesh Daemon")
     parser.add_argument("--name", default=socket.gethostname(), help="Agent name")
-    parser.add_argument("--api-port", type=int, default=8080, help="Hermes API port")
-    parser.add_argument("--capabilities", default="", help="Comma-separated capabilities")
-    parser.add_argument("--delegate", default="", help="Delegate a task: 'peer_id:task description'")
-    parser.add_argument("--broadcast", default="", help="Broadcast a task to all online trusted peers")
+    parser.add_argument(
+        "--mesh-port",
+        type=int,
+        default=9445,
+        help="Port for peer-to-peer task delegation (default: 9445)",
+    )
+    parser.add_argument(
+        "--capabilities",
+        default="",
+        help="Comma-separated capabilities",
+    )
+    parser.add_argument(
+        "--delegate",
+        default="",
+        help="Delegate a one-shot task: 'peer_id:task description'",
+    )
+    parser.add_argument(
+        "--broadcast",
+        default="",
+        help="Broadcast a one-shot task to all online trusted peers",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Prompt for handshake confirmations directly (no separate watcher needed)",
+    )
     parser.add_argument("--debug", action="store_true", help="Debug logging")
     args = parser.parse_args()
 
@@ -428,13 +658,14 @@ def main():
 
     daemon = MeshDaemon(
         agent_name=args.name,
-        api_port=args.api_port,
+        mesh_port=args.mesh_port,
         capabilities=caps,
+        interactive=args.interactive,
     )
 
     daemon.start()
 
-    # Handle delegation / broadcast flags
+    # One-shot delegation mode
     if args.delegate:
         if ":" not in args.delegate:
             print("  Usage: --delegate \"peer_id:task description\"")
@@ -448,18 +679,22 @@ def main():
         return
 
     if args.broadcast:
-        print(f"\n  Broadcasting task to all online trusted peers...")
+        print("\n  Broadcasting task to all online trusted peers...")
         results = daemon.broadcast_task(args.broadcast.strip())
         for r in results:
-            print(f"  [{r['peer']}] {'OK' if r['success'] else 'FAIL'}: {r.get('result', r.get('error', 'unknown'))}")
+            status = "OK" if r["success"] else "FAIL"
+            detail = r.get("result", r.get("error", "unknown"))
+            print(f"  [{r['peer']}] {status}: {detail}")
         daemon.stop()
         return
 
-    print(f"\n◈ Hermes Mesh v0.2.0")
-    print(f"  Agent:    {daemon.self_info.name}")
-    print(f"  Address:  {daemon.self_info.address}")
-    print(f"  API port: {daemon.self_info.api_port}")
-    print(f"  Peers:    {len(daemon.get_peers())} known")
+    print(f"\n◈ Hermes Mesh v{MESH_VERSION}")
+    print(f"  Agent:       {daemon.self_info.name}")
+    print(f"  Address:     {daemon.self_info.address}")
+    print(f"  Mesh port:   {daemon.self_info.mesh_port}")
+    print(f"  Peers:       {len(daemon.get_peers())} known")
+    if args.interactive:
+        print(f"  Handshake:   interactive (you'll be prompted)")
     print(f"\n  Watching for peers... (Ctrl+C to stop)\n")
 
     try:
@@ -468,18 +703,20 @@ def main():
             peers = daemon.get_peers()
             online = [p for p in peers if p.status == "online"]
             trusted = [p for p in peers if p.trusted]
-            print(f"  [{time.strftime('%H:%M:%S')}] {len(online)} online / {len(trusted)} trusted / {len(peers)} total")
+            timestamp = time.strftime("%H:%M:%S")
+            print(f"  [{timestamp}] {len(online)} online / {len(trusted)} trusted / {len(peers)} total")
 
-            # Check for pending handshakes
-            signal_path = MESH_HOME / "pending_handshake.json"
-            if signal_path.exists():
-                try:
-                    handshake = json.loads(signal_path.read_text())
-                    print(f"\n  ⚡ New peer detected: {handshake['name']} @ {handshake['address']}")
-                    print(f"     Run: /mesh connect {handshake['id']}")
-                    signal_path.unlink()
-                except Exception:
-                    pass
+            # Show pending handshakes if NOT interactive (interactive mode handles them)
+            if not args.interactive:
+                signal_path = MESH_HOME / "pending_handshake.json"
+                if signal_path.exists():
+                    try:
+                        handshake = json.loads(signal_path.read_text())
+                        print(f"\n  ⚡ New peer detected: {handshake['name']} @ {handshake['address']}")
+                        print(f"     Run with --interactive or start mesh-handshake-watcher.py to trust it")
+                        signal_path.unlink()
+                    except Exception:
+                        pass
 
     except KeyboardInterrupt:
         print("\n  Shutting down...")

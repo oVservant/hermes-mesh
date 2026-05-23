@@ -39,6 +39,58 @@ Dependencias del script de discovery:
 pip install zeroconf
 ```
 
+## Uso
+
+### Con el flag interactivo (recomendado)
+
+Un solo comando hace todo — discovery, heartbeat, handshake y server de delegación:
+
+```bash
+python scripts/mesh-daemon.py --name my-agent --interactive
+```
+
+Cuando un peer nuevo aparece, te pregunta ahí mismo:
+
+```
+⚡ New peer detected: MacBook @ 192.168.1.11
+Trust this peer? (y/n):
+```
+
+Decís que sí una vez, y de ahí en más se reconecta automáticamente (TOFU).
+
+### Modo silencioso + watcher separado
+
+Si preferís separar el daemon del handshake:
+
+```bash
+# Terminal 1: daemon
+python scripts/mesh-daemon.py --name my-agent
+
+# Terminal 2: handshake watcher
+python scripts/mesh-handshake-watcher.py
+```
+
+### Delegación one-shot desde CLI
+
+```bash
+# Delegar a un peer específico
+python scripts/mesh-daemon.py --name my-agent --delegate "server-linux@192.168.1.10:build main.go"
+
+# Broadcast a todos los peers online
+python scripts/mesh-daemon.py --name my-agent --broadcast "run tests"
+```
+
+### Desde Hermes (con el skill cargado)
+
+```bash
+/mesh status
+/mesh peers
+/mesh dashboard
+/mesh delegate server-linux "npm run build"
+/mesh broadcast "pull latest changes"
+/mesh watch
+```
+
 ## Comandos
 
 Una vez cargado el skill, usás estos comandos en tu sesión de Hermes:
@@ -70,52 +122,33 @@ Los peers aparecen solos. No hay que configurar nada.
 
 ## Handshake
 
-Cuando se detecta un peer nuevo, el daemon escribe `~/.hermes/mesh/pending_handshake.json`.
-El script `scripts/mesh-handshake-watcher.py` (o el skill handler) lo detecta y pregunta:
+Cuando se detecta un peer nuevo, el daemon:
 
-> ⚡ New peer detected: MacBook @ 192.168.1.11
-> Trust this peer? (y/n):
+**Con `--interactive`:** pregunta ahí mismo si querés confiar.
+**Sin `--interactive`:** escribe `~/.hermes/mesh/pending_handshake.json` y espera que el watcher (o el skill) lo lea.
 
 ### Handshake flow (end-to-end)
 
 1. **Daemon** descubre un peer nuevo vía mDNS y escribe `pending_handshake.json`
-2. **Watcher** (`scripts/mesh-handshake-watcher.py`) lo detecta (polla cada 2s)
+2. El **thread interactivo** (o `mesh-handshake-watcher.py`) lo detecta
 3. Prompt: *"⚡ New peer detected: {name} @ {address}"*
-4. En **y** (trust): escribe `handshake_response.json` con `action: "trust"` → peer marcado como confiable
-5. En **n** (reject): `action: "reject"` → peer removido
-6. El signal file se borra después de procesar
-7. Una vez trusteado, el peer se reconecta automáticamente (TOFU)
-
-Run the watcher alongside the daemon:
-```bash
-# Terminal 1: daemon
-python scripts/mesh-daemon.py --name my-agent
-
-# Terminal 2: handshake watcher
-python scripts/mesh-handshake-watcher.py
-```
-
-También se puede importar programáticamente:
-```python
-from mesh_handshake_watcher import HandshakeWatcher
-watcher = HandshakeWatcher()
-watcher.handle_pending(daemon)  # Returns 'trust', 'reject', or None
-```
+4. En **y** (trust): peer se guarda en `known_peers.json` → confiable
+5. En **n** (reject): peer se descarta
+6. La próxima vez que aparezca, se reconecta automáticamente (TOFU)
 
 Los peers confiables se guardan en `~/.hermes/mesh/known_peers.json`.
 
-## Delegación entre agentes
+## Delegación entre agentes (peer-to-peer)
 
-La delegación usa la API HTTP interna de Hermes Agent. El daemon envía un POST a `http://{peer.address}:{peer.api_port}/execute` con el payload `{"command": "...", "timeout": 300}` usando `urllib` de stdlib.
+El daemon levanta un mini-server HTTP en el puerto `--mesh-port` (default 9445) usando
+solo `http.server` de stdlib. No depende de la API de Hermes Agent — es peer-to-peer directo.
 
-Cuando decís `/mesh delegate server-linux "build main.go"`, el skill:
+Cuando delegás una tarea con `/mesh delegate server-linux "build main.go"`:
 
-1. Busca el peer `server-linux` en la lista de peers conocidos
-2. Se conecta a su API Hermes vía HTTP
-3. Delega la tarea
-4. Te devuelve el resultado
-
-Si el peer está offline, te avisa y no insiste.
+1. Se busca el peer `server-linux` en la lista de peers conocidos
+2. Se manda un POST a `http://{peer.address}:{peer.mesh_port}/execute`
+3. El peer destino recibe la tarea y la escribe en `~/.hermes/mesh/pending_tasks.json`
+4. Hermes (o un watcher de tareas) la recoge y la ejecuta
 
 También podés usar el daemon directamente por CLI:
 
@@ -155,8 +188,8 @@ hermes-mesh/
 ├── SKILL.md                  ← Este archivo, el skill que se carga en Hermes
 ├── PRODUCT_VISION.md         ← Documento de visión del producto
 ├── scripts/
-│   ├── mesh-daemon.py              ← Daemon de discovery mDNS + heartbeat + handshake
-│   └── mesh-handshake-watcher.py   ← Watcher de handshakes (prompt al usuario)
+│   ├── mesh-daemon.py              ← Daemon de discovery mDNS + heartbeat + HTTP server + handshake
+│   └── mesh-handshake-watcher.py   ← Watcher de handshakes standalone (alternativa a --interactive)
 └── dashboard/
     └── radar.html                  ← Radar HTML autocontenido
 ```
@@ -164,7 +197,7 @@ hermes-mesh/
 ## Próximos pasos (roadmap)
 
 - [ ] mTLS entre peers para autenticación mutua
-- [ ] Routing inteligente: \"ejecutá esto en el que tenga más RAM\"
+- [ ] Routing inteligente: "ejecutá esto en el que tenga más RAM"
 - [ ] Sync de skills entre agents del mesh
 - [ ] Modo bridge vía Tailscale para redes distintas
 - [ ] Dashboard embebido en vez de HTML separado

@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-Hermes Mesh — Handshake Watcher.
+Hermes Mesh — Handshake Watcher (standalone).
 
 Watches ~/.hermes/mesh/pending_handshake.json for new peer discoveries
 and prompts the user to trust or reject them.
 
 Usage:
     python scripts/mesh-handshake-watcher.py
+
+Note: MeshDaemon now has a built-in --interactive flag that does this
+without needing a separate process. Use this standalone watcher only if
+you prefer decoupling the handshake prompt from the daemon process.
 
 Can also be imported and used programmatically:
     from mesh_handshake_watcher import HandshakeWatcher

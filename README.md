@@ -31,7 +31,7 @@
 | 🤝 | **Handshake** | First time a peer appears, you're asked to trust it. After that, automatic. |
 | 💓 | **Heartbeat** | Peers ping every 3 seconds. Green = online, Red = gone. |
 | 📡 | **Radar dashboard** | Open a submarine-style radar in your browser. See all nodes at a glance. |
-| 🚚 | **Delegation** | Send tasks to any connected peer from any Hermes session. |
+| 🚚 | **Delegation** | Peer-to-peer via built-in HTTP server (stdlib). No Hermes API dependency. |
 
 <br>
 
@@ -78,21 +78,13 @@ pip install zeroconf
 /skill hermes-mesh
 ```
 
-Or start the daemon directly:
+Or start the daemon directly — one command does it all (discovery, heartbeat, handshake, and task receiver):
 
 ```bash
-python ~/Projects/hermes-mesh/scripts/mesh-daemon.py --name server-linux
+python ~/Projects/hermes-mesh/scripts/mesh-daemon.py --name server-linux --interactive
 ```
 
-### 3. Start the handshake watcher (separate terminal)
-
-The watcher detects new peers and asks you to trust them:
-
-```bash
-python ~/Projects/hermes-mesh/scripts/mesh-handshake-watcher.py
-```
-
-When a new peer appears, you'll see:
+When a new peer appears, you'll be prompted right there:
 ```
 ⚡ New peer detected: MacBook @ 192.168.1.11
 Trust this peer? (y/n):
@@ -100,7 +92,7 @@ Trust this peer? (y/n):
 
 Say yes once — it's automatic forever after (TOFU).
 
-### 4. Watch peers appear
+### 3. Watch peers appear
 
 ```bash
 /mesh status
@@ -109,7 +101,7 @@ Say yes once — it's automatic forever after (TOFU).
 
 The first time a peer is detected, it'll already be in your peer list.
 
-### 5. Open the radar
+### 4. Open the radar
 
 ```bash
 /mesh dashboard
@@ -117,7 +109,7 @@ The first time a peer is detected, it'll already be in your peer list.
 
 Or open `dashboard/radar.html` directly in any browser.
 
-### 6. Delegate tasks
+### 5. Delegate tasks
 
 ```bash
 /mesh delegate server-linux "npm run build"
