@@ -15,9 +15,12 @@ import argparse
 import json
 import logging
 import os
+import signal
 import socket
+import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -51,7 +54,10 @@ SERVICE_TYPE = "_hermes-mesh._tcp.local."
 DISCOVERY_PORT = 9445
 HEARTBEAT_INTERVAL = 3.0
 MISSED_THRESHOLD = 3
-MESH_VERSION = "0.3.0"
+MESH_VERSION = "0.4.0"
+TASK_RESULTS_PATH = MESH_HOME / "task_results.json"
+COMPLETED_TASKS_PATH = MESH_HOME / "completed_tasks.json"
+TASK_WATCHER_INTERVAL = 2.0  # seconds between polls for pending tasks
 
 
 # ── Data types ──────────────────────────────────────────────────────────
@@ -93,6 +99,15 @@ class MeshHTTPHandler(BaseHTTPRequestHandler):
         if self.path == "/status":
             summary = self.daemon.get_status_summary()
             self._json_response(200, summary)
+        elif self.path.startswith("/results"):
+            # /results?task_id=xxx or /results (all)
+            task_id = None
+            qs = self.path.split("?", 1)[-1] if "?" in self.path else ""
+            for part in qs.split("&"):
+                if part.startswith("task_id="):
+                    task_id = part.split("=", 1)[1]
+            results = self.daemon.get_task_results(task_id)
+            self._json_response(200, {"results": results})
         else:
             self._json_response(404, {"error": "not found"})
 
@@ -107,24 +122,52 @@ class MeshHTTPHandler(BaseHTTPRequestHandler):
                 return
 
             command = data.get("command", "")
-            task_id = data.get("task_id", "")
+            task_id = data.get("task_id", str(uuid.uuid4()))
+            from_peer = data.get("from_peer", "unknown")
+            callback_address = data.get("callback_address", "")
 
             task_entry = {
                 "command": command,
                 "task_id": task_id,
-                "from_peer": data.get("from_peer", "unknown"),
+                "from_peer": from_peer,
+                "callback_address": callback_address,
                 "received_at": time.time(),
             }
 
-            # Store in pending tasks file — Hermes skill picks it up
+            # Store in pending tasks file — task watcher picks it up automatically
             pending_tasks_path = MESH_HOME / "pending_tasks.json"
             self.daemon._with_lock_write_json(pending_tasks_path, task_entry)
 
-            # Mark peer as busy
-            self.daemon.mark_self_busy()
-
-            logger.info(f"Received task from {data.get('from_peer', 'unknown')}: {command[:80]}")
+            logger.info(f"Received task {task_id} from {from_peer}: {command[:80]}")
             self._json_response(200, {"status": "accepted", "task_id": task_id})
+
+        elif self.path == "/result":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                self._json_response(400, {"error": "invalid JSON"})
+                return
+
+            task_id = data.get("task_id", "unknown")
+            success = data.get("success", False)
+            output = data.get("output", "")
+            error = data.get("error", "")
+            from_peer = data.get("from_peer", "unknown")
+
+            result_entry = {
+                "task_id": task_id,
+                "success": success,
+                "output": output,
+                "error": error,
+                "from_peer": from_peer,
+                "received_at": time.time(),
+            }
+            self.daemon._store_result(task_id, result_entry)
+            logger.info(f"Received result for task {task_id} from {from_peer}: success={success}")
+            self._json_response(200, {"status": "received", "task_id": task_id})
+
         else:
             self._json_response(404, {"error": "not found"})
 
@@ -193,6 +236,7 @@ class MeshDaemon:
             self._threads.append(Thread(target=self._udp_discovery_loop, daemon=True))
 
         self._threads.append(Thread(target=self._heartbeat_loop, daemon=True))
+        self._threads.append(Thread(target=self._task_watcher_thread, daemon=True))
 
         if self.interactive:
             self._threads.append(Thread(target=self._handshake_thread, daemon=True))
@@ -276,17 +320,27 @@ class MeshDaemon:
     # ── Delegation (outgoing) ────────────────────────────────────
 
     def delegate_task(self, peer_id: str, task_description: str, timeout: int = 300) -> dict:
-        """Send a task to a specific peer's mesh HTTP server."""
+        """Send a task to a specific peer's mesh HTTP server.
+
+        Includes callback_address so the receiving peer can POST results back
+        to /result on this daemon when the task completes.
+        """
         peer = self.get_peer(peer_id)
         if not peer:
             return {"success": False, "error": f"Peer not found: {peer_id}"}
         if peer.status == "offline":
             return {"success": False, "error": f"Peer is offline: {peer_id}"}
 
+        task_id = str(uuid.uuid4())
+        callback_address = f"{self.self_info.address}:{self.self_info.mesh_port}"
+
         url = f"http://{peer.address}:{peer.mesh_port}/execute"
         payload = {
             "command": task_description,
             "from_peer": self.self_info.name,
+            "task_id": task_id,
+            "callback_address": callback_address,
+            "timeout": timeout,
         }
         body = json.dumps(payload).encode()
         req = Request(url, data=body, headers={"Content-Type": "application/json"})
@@ -294,11 +348,12 @@ class MeshDaemon:
         try:
             resp = urlopen(req, timeout=10)
             result = json.loads(resp.read().decode())
-            return {"success": True, "peer": peer_id, "result": result}
+            return {"success": True, "peer": peer_id, "task_id": task_id, "result": result}
         except URLError as e:
             return {
                 "success": False,
                 "peer": peer_id,
+                "task_id": task_id,
                 "error": str(e.reason if hasattr(e, "reason") else e),
             }
 
@@ -553,6 +608,161 @@ class MeshDaemon:
                 }
             )
         )
+
+    # ── Task Watcher ───────────────────────────────────────────────
+
+    def _task_watcher_thread(self):
+        """Watch pending_tasks.json and execute any new tasks automatically."""
+        logger.info("Task watcher started — executing pending tasks automatically")
+        seen_task_ids: set = set()
+
+        while self._running:
+            pending_path = MESH_HOME / "pending_tasks.json"
+            if pending_path.exists():
+                try:
+                    data = json.loads(pending_path.read_text())
+                    if not isinstance(data, list):
+                        data = []
+                    tasks = data
+                except (json.JSONDecodeError, FileNotFoundError):
+                    tasks = []
+
+                for task_id in list(seen_task_ids):
+                    if not any(t.get("task_id") == task_id for t in tasks):
+                        seen_task_ids.discard(task_id)
+
+                for task in tasks:
+                    tid = task.get("task_id", "")
+                    if tid in seen_task_ids:
+                        continue
+                    seen_task_ids.add(tid)
+
+                    logger.info(f"Executing task {tid}: {task.get('command', '')[:80]}")
+                    success, output, error = self._execute_task(task)
+
+                    # Store result locally
+                    self._store_result(tid, {
+                        "task_id": tid,
+                        "success": success,
+                        "output": output,
+                        "error": error,
+                        "command": task.get("command", ""),
+                        "from_peer": task.get("from_peer", "unknown"),
+                        "completed_at": time.time(),
+                    })
+
+                    # Send callback to origin peer if callback_address is set
+                    callback_address = task.get("callback_address", "")
+                    if callback_address:
+                        self._send_callback(tid, callback_address, success, output, error)
+
+                # Remove executed tasks from pending
+                if tasks:
+                    self._remove_pending_tasks([t.get("task_id", "") for t in tasks])
+
+            time.sleep(TASK_WATCHER_INTERVAL)
+
+    def _execute_task(self, task: dict) -> tuple:
+        """Execute a shell command. Returns (success, stdout, stderr)."""
+        command = task.get("command", "")
+        timeout = task.get("timeout", 300)
+        try:
+            result = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(Path.home()),
+            )
+            success = result.returncode == 0
+            output = result.stdout.strip()
+            error = result.stderr.strip() if not success else ""
+            if not success and not error:
+                error = f"exit code {result.returncode}"
+            return success, output, error
+        except subprocess.TimeoutExpired:
+            return False, "", f"Task timed out after {timeout}s"
+        except Exception as e:
+            return False, "", str(e)
+
+    def _store_result(self, task_id: str, entry: dict):
+        """Store a task result in completed_tasks.json."""
+        with self._lock:
+            existing = []
+            if COMPLETED_TASKS_PATH.exists():
+                try:
+                    existing = json.loads(COMPLETED_TASKS_PATH.read_text())
+                    if not isinstance(existing, list):
+                        existing = []
+                except (json.JSONDecodeError, FileNotFoundError):
+                    existing = []
+            # Update if exists, otherwise append
+            found = False
+            for i, item in enumerate(existing):
+                if item.get("task_id") == task_id:
+                    existing[i] = entry
+                    found = True
+                    break
+            if not found:
+                existing.append(entry)
+            COMPLETED_TASKS_PATH.write_text(json.dumps(existing, indent=2))
+
+    def _send_callback(self, task_id: str, callback_address: str,
+                       success: bool, output: str, error: str):
+        """Send task result back to the originating peer."""
+        payload = {
+            "task_id": task_id,
+            "success": success,
+            "output": output,
+            "error": error,
+            "from_peer": self.self_info.name,
+        }
+        body = json.dumps(payload).encode()
+        req = Request(
+            f"http://{callback_address}/result",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            resp = urlopen(req, timeout=5)
+            if resp.status == 200:
+                logger.info(f"Callback sent for task {task_id} to {callback_address}")
+            else:
+                logger.warning(f"Callback for task {task_id} to {callback_address} returned {resp.status}")
+        except Exception as e:
+            logger.warning(f"Failed to send callback for task {task_id} to {callback_address}: {e}")
+
+    def _remove_pending_tasks(self, task_ids: list):
+        """Remove executed tasks from pending_tasks.json."""
+        pending_path = MESH_HOME / "pending_tasks.json"
+        with self._lock:
+            if not pending_path.exists():
+                return
+            try:
+                data = json.loads(pending_path.read_text())
+                if not isinstance(data, list):
+                    data = []
+            except (json.JSONDecodeError, FileNotFoundError):
+                return
+            filtered = [t for t in data if t.get("task_id", "") not in task_ids]
+            if len(filtered) != len(data):
+                pending_path.write_text(json.dumps(filtered, indent=2))
+                logger.debug(f"Cleaned up {len(data) - len(filtered)} completed tasks from pending")
+
+    def get_task_results(self, task_id: Optional[str] = None) -> list:
+        """Return completed task results, optionally filtered by task_id."""
+        if not COMPLETED_TASKS_PATH.exists():
+            return []
+        try:
+            results = json.loads(COMPLETED_TASKS_PATH.read_text())
+            if not isinstance(results, list):
+                return []
+        except (json.JSONDecodeError, FileNotFoundError):
+            return []
+        if task_id:
+            return [r for r in results if r.get("task_id") == task_id]
+        return results
 
     # ── Persistence ────────────────────────────────────────────────
 

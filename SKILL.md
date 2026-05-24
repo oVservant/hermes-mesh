@@ -1,9 +1,9 @@
 ---
 name: hermes-mesh
-description: "Mesh network for Hermes Agents: auto-discovery, heartbeat, handshake, and task delegation between agents on the same local network."
-version: 0.3.0
+description: "Mesh network for Hermes Agents: auto-discovery, heartbeat, handshake, task delegation, and automated task execution with result callbacks between agents on the same local network."
+version: 0.4.0
 author: oVservant
-tags: [mesh, discovery, delegation, multi-agent, networking]
+tags: [mesh, discovery, delegation, multi-agent, networking, real-time]
 ---
 
 # Hermes Mesh
@@ -19,6 +19,8 @@ Cuando cargás el skill en un Hermes Agent, automáticamente:
 3. **Handshake** — pregunta si querés conectar al peer detectado
 4. **Heartbeat** — cada nodo manda ping cada 3s para saber quién está vivo
 5. **Delegación** — podés mandar tareas a cualquier peer conectado
+6. **Task Watcher** — las tareas se ejecutan automáticamente sin intervención manual
+7. **Callback** — el peer destino devuelve el resultado al origen apenas termina
 
 No necesita servicios externos, no necesita puertos abiertos, no necesita internet.
 
@@ -143,12 +145,30 @@ Los peers confiables se guardan en `~/.hermes/mesh/known_peers.json`.
 El daemon levanta un mini-server HTTP en el puerto `--mesh-port` (default 9445) usando
 solo `http.server` de stdlib. No depende de la API de Hermes Agent — es peer-to-peer directo.
 
+### Flow completo (v0.4)
+
 Cuando delegás una tarea con `/mesh delegate server-linux "build main.go"`:
 
 1. Se busca el peer `server-linux` en la lista de peers conocidos
-2. Se manda un POST a `http://{peer.address}:{peer.mesh_port}/execute`
-3. El peer destino recibe la tarea y la escribe en `~/.hermes/mesh/pending_tasks.json`
-4. Hermes (o un watcher de tareas) la recoge y la ejecuta
+2. Se genera un `task_id` único (UUID4) y se incluye el `callback_address` del origen
+3. Se manda un POST a `http://{peer.address}:{peer.mesh_port}/execute`
+4. El peer destino recibe la tarea y la escribe en `~/.hermes/mesh/pending_tasks.json`
+5. **NUEVO**: El **task watcher** (thread integrado en el daemon) detecta la tarea y la ejecuta automáticamente
+6. **NUEVO**: Al terminar, el resultado se guarda en `~/.hermes/mesh/completed_tasks.json`
+7. **NUEVO**: Se hace callback automático via `POST /result` al origen con el output
+8. La tarea ejecutada se limpia de `pending_tasks.json`
+
+Esto significa que **no tenés que avisarle al agente** que revise sus tareas — se ejecutan solas,
+y el agente que delegó recibe el resultado automáticamente.
+
+### Endpoints HTTP
+
+| Endpoint | Método | Descripción |
+|---|---|---|
+| `/status` | GET | Estado del mesh: peers, tareas, stats |
+| `/results` | GET | Resultados de tareas completadas. Query: `?task_id=xxx` para filtrar |
+| `/execute` | POST | Recibir una tarea delegada (body: `{command, task_id, callback_address}`) |
+| `/result` | POST | Recibir resultado de una tarea completada (body: `{task_id, success, output, error}`) |
 
 También podés usar el daemon directamente por CLI:
 
@@ -188,16 +208,28 @@ hermes-mesh/
 ├── SKILL.md                  ← Este archivo, el skill que se carga en Hermes
 ├── PRODUCT_VISION.md         ← Documento de visión del producto
 ├── scripts/
-│   ├── mesh-daemon.py              ← Daemon de discovery mDNS + heartbeat + HTTP server + handshake
+│   ├── mesh-daemon.py              ← Daemon: discovery mDNS, heartbeat, HTTP server, task watcher, handshake
 │   └── mesh-handshake-watcher.py   ← Watcher de handshakes standalone (alternativa a --interactive)
 └── dashboard/
     └── radar.html                  ← Radar HTML autocontenido
 ```
 
+### Archivos de datos (en ~/.hermes/mesh/)
+
+| Archivo | Propósito |
+|---|---|
+| `known_peers.json` | Peers confiables (persistencia) |
+| `pending_tasks.json` | Tareas delegadas pendientes de ejecución |
+| `completed_tasks.json` | Resultados de tareas ya ejecutadas |
+| `agent_status.json` | Estado del agente local (busy/online) |
+| `pending_handshake.json` | Handshakes nuevos esperando confirmación |
+
 ## Próximos pasos (roadmap)
 
+- [x] ~~Task watcher automático + callback de resultados~~ (v0.4)
 - [ ] mTLS entre peers para autenticación mutua
 - [ ] Routing inteligente: "ejecutá esto en el que tenga más RAM"
 - [ ] Sync de skills entre agents del mesh
 - [ ] Modo bridge vía Tailscale para redes distintas
 - [ ] Dashboard embebido en vez de HTML separado
+- [ ] Cola de tareas con reintentos si el peer origen está offline al momento del callback
