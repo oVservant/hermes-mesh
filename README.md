@@ -2,9 +2,9 @@
 
 # ◈ Hermes Mesh
 
-**Mesh network for Hermes Agents — auto-discovery, radar dashboard, and task delegation between agents on the same local network.**
+**Mesh network for Hermes Agents — auto-discovery, radar dashboard, task delegation, and automated execution with result callbacks between agents on the same local network.**
 
-[![Version](https://img.shields.io/badge/version-0.3.0-00ff88?style=flat-square)]()
+[![Version](https://img.shields.io/badge/version-0.4.0-00ff88?style=flat-square)]()
 [![Hermes Skill](https://img.shields.io/badge/hermes-skill-7c3aed?style=flat-square)]()
 [![License](https://img.shields.io/badge/license-MIT-555555?style=flat-square)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)]()
@@ -31,7 +31,9 @@
 | 🤝 | **Handshake** | First time a peer appears, you're asked to trust it. After that, automatic. |
 | 💓 | **Heartbeat** | Peers ping every 3 seconds. Green = online, Red = gone. |
 | 📡 | **Radar dashboard** | Open a submarine-style radar in your browser. See all nodes at a glance. |
-| 🚚 | **Delegation** | Peer-to-peer via built-in HTTP server (stdlib). No Hermes API dependency. |
+| 🚚 | **Delegation** | Peer-to-peer via built-in HTTP server (stdlib). Send tasks to any connected peer. |
+| ⚙️ | **Auto-execution** | Tasks execute automatically via built-in task watcher. No manual intervention needed. |
+| 🔄 | **Result callback** | Completed task results are sent back to the originating peer automatically. |
 
 <br>
 
@@ -71,14 +73,9 @@ Install the discovery dependency (once per machine):
 pip install zeroconf
 ```
 
-### 2. Load it
+### 2. Start the daemon
 
-```bash
-# In any Hermes session
-/skill hermes-mesh
-```
-
-Or start the daemon directly — one command does it all (discovery, heartbeat, handshake, and task receiver):
+One command does it all — discovery, heartbeat, handshake, task watcher, and HTTP server:
 
 ```bash
 python ~/Projects/hermes-mesh/scripts/mesh-daemon.py --name server-linux --interactive
@@ -99,29 +96,16 @@ Say yes once — it's automatic forever after (TOFU).
 /mesh peers
 ```
 
-The first time a peer is detected, it'll already be in your peer list.
+### 4. Delegate tasks
 
-### 4. Open the radar
-
-```bash
-/mesh dashboard
-```
-
-Or open `dashboard/radar.html` directly in any browser.
-
-### 5. Delegate tasks
+Tasks execute automatically on the receiving peer — no need to tell anyone to "check pending tasks":
 
 ```bash
 /mesh delegate server-linux "npm run build"
 /mesh broadcast "pull latest changes"
 ```
 
-Or use the daemon directly for one-shot delegation:
-
-```bash
-python scripts/mesh-daemon.py --name my-agent --delegate "server-linux:build main.go"
-python scripts/mesh-daemon.py --name my-agent --broadcast "run tests"
-```
+Results are sent back automatically via callback. Check them with `/mesh results` or `GET /results` on the HTTP endpoint.
 
 <br>
 
@@ -129,36 +113,45 @@ python scripts/mesh-daemon.py --name my-agent --broadcast "run tests"
 
 | Command | What it does |
 |---|---|
-| `/mesh status` | Show agent info + connected peers |
+| `/mesh status` | Show agent info + connected peers + task stats |
 | `/mesh peers` | Detailed peer list (name, IP, status, last heartbeat) |
 | `/mesh dashboard` | Open the radar in browser |
 | `/mesh connect <peer_id>` | Force handshake with a peer |
 | `/mesh delegate <peer_id> <task>` | Delegate a task to a specific peer |
 | `/mesh broadcast <task>` | Send task to all online peers |
 | `/mesh watch` | Real-time monitor mode |
+| `/mesh results [task_id]` | View completed task results |
+
+### HTTP API
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/status` | GET | Mesh status: peers, tasks, agent info |
+| `/results?task_id=xxx` | GET | Completed task results (optional filter) |
+| `/execute` | POST | Receive a delegated task |
+| `/result` | POST | Receive a task result callback |
 
 <br>
 
 ## 🏗️ Architecture
 
 ```
-                    ┌──────────────────┐
-                    │    MacBook       │
-                    │  Hermes + Mesh   │
-                    └───────┬──────────┘
-                            │ mDNS
-              ┌─────────────┼─────────────┐
-              │             │             │
-              ▼             ▼             ▼
-    ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-    │    Server    │ │    Windows   │ │    Any...    │
-    │  Hermes Mesh │ │  Hermes Mesh │ │   Hermes Mesh│
-    └──────────────┘ └──────────────┘ └──────────────┘
+┌──────────────────┐     mDNS (Zeroconf)     ┌──────────────────┐
+│    MacBook       │◄──────────────────────►│     Server       │
+│  Hermes + Mesh   │                        │  Hermes + Mesh   │
+└──────┬───────────┘                        └──────┬───────────┘
+       │                                           │
+       │              ┌──────────────────┐         │
+       └─────────────►│     Windows      │◄────────┘
+                      │  Hermes + Mesh   │
+                      └──────────────────┘
 ```
 
 - **Peer-to-peer.** No central server. Every agent is equal.
 - **Local network only.** No internet required. No cloud dependency.
 - **Zero configuration.** Discovery is fully automatic via mDNS.
+- **Auto-execution.** Built-in task watcher executes delegated tasks without manual intervention.
+- **Result callbacks.** Completed tasks report back to the originating peer automatically.
 
 <br>
 
@@ -168,7 +161,7 @@ python scripts/mesh-daemon.py --name my-agent --broadcast "run tests"
 |---|---|
 | **TOFU** | First encounter asks for manual approval. After that, auto-trusted. |
 | **API Token** | Share a secret token between agents for authenticated requests. |
-| **mTLS** | Certificate-based mutual authentication (coming in v0.4). |
+| **mTLS** | Certificate-based mutual authentication (planned). |
 
 Trusted peers persist in `~/.hermes/mesh/known_peers.json`.
 
@@ -182,21 +175,31 @@ hermes-mesh/
 ├── README.md              ← This file
 ├── PRODUCT_VISION.md      ← Product vision (non-technical)
 ├── scripts/
-│   ├── mesh-daemon.py              ← Discovery + heartbeat + handshake daemon
-│   └── mesh-handshake-watcher.py   ← Watcher that prompts user to trust new peers
+│   ├── mesh-daemon.py              ← Discovery, heartbeat, handshake, task watcher, HTTP server
+│   └── mesh-handshake-watcher.py   ← Standalone watcher that prompts user to trust new peers
 └── dashboard/
     └── radar.html          ← Standalone radar HTML (no server needed)
 ```
+
+### Data files (in ~/.hermes/mesh/)
+
+| File | Purpose |
+|---|---|
+| `known_peers.json` | Trusted peers (persistent) |
+| `pending_tasks.json` | Delegated tasks awaiting execution |
+| `completed_tasks.json` | Results of executed tasks |
+| `pending_handshake.json` | New handshakes awaiting confirmation |
 
 <br>
 
 ## 🗺️ Roadmap
 
+- [x] ~~Task watcher + result callbacks~~ (v0.4)
 - [ ] mTLS between peers for mutual authentication
 - [ ] Smart routing: "run this on whoever has the most RAM"
 - [ ] Skill sync across mesh agents
 - [ ] Bridge mode via Tailscale for different networks
-- [ ] Embdedded dashboard (instead of separate HTML)
+- [ ] Embedded dashboard (instead of separate HTML)
 
 <br>
 
@@ -210,6 +213,6 @@ PRs welcome. Keep it simple — this project follows the **skill-first** philoso
 
 <div align="center">
 
-Made by [@oVservant](https://github.com/oVservant) · Hermes Mesh v0.3.0 · Skill-based · Zero-config · Peer-to-peer
+Made by [@oVservant](https://github.com/oVservant) · Hermes Mesh v0.4.0 · Skill-based · Zero-config · Peer-to-peer
 
 </div>
